@@ -209,6 +209,10 @@ def main(cfg: DictConfig):
         f"horizon range = [{int(sample['horizon'].min())}, {int(sample['horizon'].max())}]"
     )
 
+    # Create the checkpoints dir up-front (avoids race between best-val save
+    # and regular save on epochs where only one of them fires).
+    (run_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
+
     # Save action stats so the planner can re-normalize at eval.
     torch.save(
         {"action_mean": train_ds.action_mean, "action_std": train_ds.action_std},
@@ -263,8 +267,8 @@ def main(cfg: DictConfig):
             if global_step % cfg.training.log_every == 0:
                 wandb.log(
                     {
-                        "train/loss": float(loss),
-                        "train/cos_sim": float(out["cos_sim"]),
+                        "train/loss": loss.item(),
+                        "train/cos_sim": out["cos_sim"].item(),
                         "train/grad_norm": float(grad_norm),
                         "train/lr": optimizer.param_groups[0]["lr"],
                         "train/samples_per_s": samples_per_s,
