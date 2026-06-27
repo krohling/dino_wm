@@ -33,5 +33,7 @@ wandb:
   name: null  # default: hydra run dir name
 
 hydra:
+  job:
+    chdir: true
   run:
     dir: ${oc.env:DINO_WM_RUN_BASE,./oneshot_runs}/${now:%Y-%m-%d_%H-%M-%S}

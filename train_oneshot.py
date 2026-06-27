@@ -83,8 +83,9 @@ def peak_mem_gb() -> float:
 def run_validation(model, loader, device, eval_horizons: Sequence[int]) -> dict:
     model.eval()
     per_h_cos = defaultdict(list)
+    per_h_cos_ident = defaultdict(list)
     per_h_loss = defaultdict(list)
-    total_loss, total_cos, n = 0.0, 0.0, 0
+    total_loss, total_cos, total_cos_ident, n = 0.0, 0.0, 0.0, 0
     for batch in loader:
         history = batch["history"].to(device, non_blocking=True)
         actions = batch["actions"].to(device, non_blocking=True)
@@ -94,27 +95,35 @@ def run_validation(model, loader, device, eval_horizons: Sequence[int]) -> dict:
 
         out = model(history, actions, action_mask, target)
         cos = out["cos_per_sample"]  # (B,)
-        # Per-horizon bucket
+        cos_id = out["cos_per_sample_identity"]  # (B,)
         for h in eval_horizons:
             mask = (horizons == h)
             if mask.any():
                 per_h_cos[h].append(cos[mask].mean().item())
+                per_h_cos_ident[h].append(cos_id[mask].mean().item())
                 per_h_loss[h].append((1.0 - cos[mask]).mean().item())
         bs = history.shape[0]
-        total_loss += float(out["loss"]) * bs
-        total_cos += float(out["cos_sim"]) * bs
+        total_loss += out["loss"].item() * bs
+        total_cos += out["cos_sim"].item() * bs
+        total_cos_ident += out["cos_sim_identity"].item() * bs
         n += bs
 
-    out = {
+    out_dict = {
         "val_loss": total_loss / max(1, n),
         "val_cos_sim": total_cos / max(1, n),
+        "val_cos_sim_identity": total_cos_ident / max(1, n),
+        "val_cos_sim_gain": (total_cos - total_cos_ident) / max(1, n),
+        "val_n_samples": n,
     }
     for h in eval_horizons:
         if per_h_cos[h]:
-            out[f"val_cos_sim_h{h}"] = float(np.mean(per_h_cos[h]))
-            out[f"val_loss_h{h}"] = float(np.mean(per_h_loss[h]))
-    out["val_n_samples"] = n
-    return out
+            out_dict[f"val_cos_sim_h{h}"] = float(np.mean(per_h_cos[h]))
+            out_dict[f"val_cos_sim_identity_h{h}"] = float(np.mean(per_h_cos_ident[h]))
+            out_dict[f"val_cos_sim_gain_h{h}"] = float(
+                np.mean(per_h_cos[h]) - np.mean(per_h_cos_ident[h])
+            )
+            out_dict[f"val_loss_h{h}"] = float(np.mean(per_h_loss[h]))
+    return out_dict
 
 
 @hydra.main(config_path="conf", config_name="train_oneshot", version_base=None)
@@ -241,8 +250,8 @@ def main(cfg: DictConfig):
             optimizer.step()
 
             bs = history.shape[0]
-            running_loss += float(loss) * bs
-            running_cos += float(out["cos_sim"]) * bs
+            running_loss += loss.item() * bs
+            running_cos += out["cos_sim"].item() * bs
             n_seen += bs
             global_step += 1
 
@@ -282,11 +291,16 @@ def main(cfg: DictConfig):
 
         # Validation
         val_metrics = run_validation(model, val_loader, device, cfg.eval_horizons)
-        msg_parts = [f"val_loss={val_metrics['val_loss']:.4f}", f"val_cos={val_metrics['val_cos_sim']:.4f}"]
+        msg_parts = [
+            f"val_loss={val_metrics['val_loss']:.4f}",
+            f"val_cos={val_metrics['val_cos_sim']:.4f}",
+            f"id_cos={val_metrics['val_cos_sim_identity']:.4f}",
+            f"gain={val_metrics['val_cos_sim_gain']:+.4f}",
+        ]
         for h in cfg.eval_horizons:
-            k = f"val_cos_sim_h{h}"
+            k = f"val_cos_sim_gain_h{h}"
             if k in val_metrics:
-                msg_parts.append(f"h{h}={val_metrics[k]:.3f}")
+                msg_parts.append(f"gain_h{h}={val_metrics[k]:+.4f}")
         log.info("  " + "  ".join(msg_parts))
 
         wandb.log(
@@ -313,7 +327,7 @@ def main(cfg: DictConfig):
                 "cfg": wandb_config,
             }
             ckpt_path = run_dir / f"checkpoints/predictor_epoch{epoch}.pt"
-            ckpt_path.parent.mkdir(exist_ok=True)
+            ckpt_path.parent.mkdir(parents=True, exist_ok=True)
             torch.save(ckpt, ckpt_path)
             torch.save(ckpt, run_dir / "checkpoints/predictor_latest.pt")
             log.info(f"  saved {ckpt_path.name}")

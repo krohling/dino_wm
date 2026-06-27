@@ -62,11 +62,19 @@ class OneShotWorldModel(nn.Module):
         cos_sim = cos.mean()
         loss = 1.0 - cos_sim
 
+        # Baseline: identity prediction (copy last history frame's latent).
+        # If our predictor's cos_sim is not meaningfully higher than this, it's
+        # learned to do nothing — useful diagnostic when frames are very similar.
+        z_identity = z_obs[:, -1, :, :].detach()  # (B, P, D)
+        cos_identity = F.cosine_similarity(z_identity, z_target, dim=-1)  # (B, P)
+
         return {
             "loss": loss,
             "cos_sim": cos_sim.detach(),
+            "cos_sim_identity": cos_identity.mean().detach(),
             "z_pred": z_pred,
             "z_target": z_target,
             "horizons": action_mask.sum(dim=-1).long(),
             "cos_per_sample": cos.mean(dim=-1).detach(),  # (B,) for per-horizon bucketing
+            "cos_per_sample_identity": cos_identity.mean(dim=-1).detach(),
         }
