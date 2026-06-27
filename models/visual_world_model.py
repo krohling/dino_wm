@@ -22,6 +22,7 @@ class VWorldModel(nn.Module):
         train_encoder=True,
         train_predictor=False,
         train_decoder=True,
+        loss_on="all",  # "all" (visual + proprio) or "visual_only"
     ):
         super().__init__()
         self.num_hist = num_hist
@@ -36,8 +37,10 @@ class VWorldModel(nn.Module):
         self.train_decoder = train_decoder
         self.num_action_repeat = num_action_repeat
         self.num_proprio_repeat = num_proprio_repeat
-        self.proprio_dim = proprio_dim * num_proprio_repeat 
-        self.action_dim = action_dim * num_action_repeat 
+        self.proprio_dim = proprio_dim * num_proprio_repeat
+        self.action_dim = action_dim * num_action_repeat
+        assert loss_on in ("all", "visual_only"), loss_on
+        self.loss_on = loss_on
         self.emb_dim = self.encoder.emb_dim + (self.action_dim + self.proprio_dim) * (concat_dim) # Not used
 
         print(f"num_action_repeat: {self.num_action_repeat}")
@@ -238,7 +241,7 @@ class VWorldModel(nn.Module):
                     z_tgt[:, :, :, :-self.action_dim].detach()
                 )
 
-            loss = loss + z_loss
+            loss = loss + (z_visual_loss if self.loss_on == "visual_only" else z_loss)
             loss_components["z_loss"] = z_loss
             loss_components["z_visual_loss"] = z_visual_loss
             loss_components["z_proprio_loss"] = z_proprio_loss

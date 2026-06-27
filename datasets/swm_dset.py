@@ -25,7 +25,12 @@ class SWMTrajDataset(TrajDataset):
         transform: Optional[Callable] = None,
         normalize_action: bool = True,
         include_ood: bool = False,
+        zero_proprio: bool = False,
     ):
+        # When True, emit a constant 1-dim zero proprio regardless of what the
+        # preprocessed files contain. Useful when proprio is unreliable (e.g.
+        # OGB extraction) or when training visual-only with `model.loss_on=visual_only`.
+        self.zero_proprio = zero_proprio
         self.data_path = Path(data_path)
         self.transform = transform
         self.normalize_action = normalize_action
@@ -43,7 +48,10 @@ class SWMTrajDataset(TrajDataset):
         self.episodes = episodes
         self.seq_lengths = [int(e["length"]) for e in episodes]
         self.action_dim = int(episodes[0]["action_dim"])
-        self.proprio_dim = int(episodes[0]["proprio_dim"])
+        if self.zero_proprio:
+            self.proprio_dim = 1
+        else:
+            self.proprio_dim = int(episodes[0]["proprio_dim"])
         self.state_dim = self.proprio_dim  # no separate state channel
 
         if normalize_action:
@@ -89,7 +97,11 @@ class SWMTrajDataset(TrajDataset):
         if self.transform is not None:
             image = self.transform(image)
         action = (d["actions"] - self.action_mean) / self.action_std
-        proprio = (d["proprio"] - self.proprio_mean) / self.proprio_std
+        if self.zero_proprio:
+            T = action.shape[0]
+            proprio = torch.zeros(T, 1, dtype=torch.float32)
+        else:
+            proprio = (d["proprio"] - self.proprio_mean) / self.proprio_std
         state = proprio.clone()
         return {"visual": image, "proprio": proprio}, action, state, {}
 
@@ -107,6 +119,7 @@ def _load_split(
     num_pred: int = 0,
     frameskip: int = 1,
     include_ood: bool = False,
+    zero_proprio: bool = False,
 ):
     full = SWMTrajDataset(
         data_path=data_path,
@@ -114,6 +127,7 @@ def _load_split(
         transform=transform,
         normalize_action=normalize_action,
         include_ood=include_ood,
+        zero_proprio=zero_proprio,
     )
     n_total = len(full)
     if n_total < 2:

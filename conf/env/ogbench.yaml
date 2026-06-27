@@ -9,6 +9,7 @@ dataset:
   normalize_action: ${normalize_action}
   split_ratio: 0.9
   include_ood: false
+  zero_proprio: true
   transform:
     _target_: "datasets.img_transforms.swm_transform"
     img_size: ${img_size}
