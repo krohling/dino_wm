@@ -1,0 +1,4 @@
+depth: 6
+heads: 16
+mlp_dim: 2048
+dropout: 0.1
