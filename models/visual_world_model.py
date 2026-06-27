@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torchvision import transforms
 from einops import rearrange, repeat
 
@@ -23,6 +24,7 @@ class VWorldModel(nn.Module):
         train_predictor=False,
         train_decoder=True,
         loss_on="all",  # "all" (visual + proprio) or "visual_only"
+        loss_fn="mse",  # "mse" | "smooth_l1" | "cosine"
     ):
         super().__init__()
         self.num_hist = num_hist
@@ -41,6 +43,8 @@ class VWorldModel(nn.Module):
         self.action_dim = action_dim * num_action_repeat
         assert loss_on in ("all", "visual_only"), loss_on
         self.loss_on = loss_on
+        assert loss_fn in ("mse", "smooth_l1", "cosine"), loss_fn
+        self.loss_fn = loss_fn
         self.emb_dim = self.encoder.emb_dim + (self.action_dim + self.proprio_dim) * (concat_dim) # Not used
 
         print(f"num_action_repeat: {self.num_action_repeat}")
@@ -68,7 +72,20 @@ class VWorldModel(nn.Module):
 
         self.decoder_criterion = nn.MSELoss()
         self.decoder_latent_loss_weight = 0.25
+        # Kept for backward-compat; predictor loss uses self._emb_criterion below
+        # so that loss_fn can switch between mse/smooth_l1/cosine.
         self.emb_criterion = nn.MSELoss()
+
+    def _emb_criterion(self, pred, target):
+        if self.loss_fn == "mse":
+            return F.mse_loss(pred, target)
+        if self.loss_fn == "smooth_l1":
+            return F.smooth_l1_loss(pred, target)
+        if self.loss_fn == "cosine":
+            # 1 - cosine_similarity along the feature axis; average over the rest
+            sim = F.cosine_similarity(pred, target, dim=-1)
+            return (1.0 - sim).mean()
+        raise ValueError(self.loss_fn)
 
     def train(self, mode=True):
         super().train(mode)
@@ -224,20 +241,20 @@ class VWorldModel(nn.Module):
 
             # Compute loss for visual, proprio dims (i.e. exclude action dims)
             if self.concat_dim == 0:
-                z_visual_loss = self.emb_criterion(z_pred[:, :, :-2, :], z_tgt[:, :, :-2, :].detach())
-                z_proprio_loss = self.emb_criterion(z_pred[:, :, -2, :], z_tgt[:, :, -2, :].detach())
-                z_loss = self.emb_criterion(z_pred[:, :, :-1, :], z_tgt[:, :, :-1, :].detach())
+                z_visual_loss = self._emb_criterion(z_pred[:, :, :-2, :], z_tgt[:, :, :-2, :].detach())
+                z_proprio_loss = self._emb_criterion(z_pred[:, :, -2, :], z_tgt[:, :, -2, :].detach())
+                z_loss = self._emb_criterion(z_pred[:, :, :-1, :], z_tgt[:, :, :-1, :].detach())
             elif self.concat_dim == 1:
-                z_visual_loss = self.emb_criterion(
+                z_visual_loss = self._emb_criterion(
                     z_pred[:, :, :, :-(self.proprio_dim + self.action_dim)], \
                     z_tgt[:, :, :, :-(self.proprio_dim + self.action_dim)].detach()
                 )
-                z_proprio_loss = self.emb_criterion(
-                    z_pred[:, :, :, -(self.proprio_dim + self.action_dim): -self.action_dim], 
+                z_proprio_loss = self._emb_criterion(
+                    z_pred[:, :, :, -(self.proprio_dim + self.action_dim): -self.action_dim],
                     z_tgt[:, :, :, -(self.proprio_dim + self.action_dim): -self.action_dim].detach()
                 )
-                z_loss = self.emb_criterion(
-                    z_pred[:, :, :, :-self.action_dim], 
+                z_loss = self._emb_criterion(
+                    z_pred[:, :, :, :-self.action_dim],
                     z_tgt[:, :, :, :-self.action_dim].detach()
                 )
 
