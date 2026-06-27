@@ -1,0 +1,17 @@
+name: langtable
+args: []
+kwargs: {}
+
+dataset:
+  _target_: "datasets.swm_dset.load_langtable_slice_train_val"
+  data_path: ${oc.env:DATASET_DIR}/lt
+  n_rollout: null
+  normalize_action: ${normalize_action}
+  split_ratio: 0.9
+  include_ood: false
+  transform:
+    _target_: "datasets.img_transforms.swm_transform"
+    img_size: ${img_size}
+
+decoder_path: null
+num_workers: 4

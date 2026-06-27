@@ -1,0 +1,4 @@
+_target_: models.qwen3_vl.Qwen3VLViTEncoder
+model_id: "Qwen/Qwen3-VL-8B-Instruct"
+image_size: ${img_size}
+freeze: True
