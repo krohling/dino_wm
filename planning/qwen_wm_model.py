@@ -38,9 +38,10 @@ from PIL import Image
 log = logging.getLogger(__name__)
 
 
-# OpenAI-CLIP normalization (matches Qwen3-VL's image processor).
-_QWEN_MEAN = (0.48145466, 0.4578275, 0.40821073)
-_QWEN_STD = (0.26862954, 0.26130258, 0.27577711)
+# Qwen3-VL uses SigLIP-style normalization (image_mean=image_std=0.5).
+# Verified via AutoProcessor.from_pretrained("Qwen/Qwen3-VL-8B-Instruct").image_processor.
+_QWEN_MEAN = (0.5, 0.5, 0.5)
+_QWEN_STD = (0.5, 0.5, 0.5)
 
 
 @dataclasses.dataclass
@@ -50,8 +51,8 @@ class _PromptInfo:
     input_ids: torch.Tensor          # (L,)
     attention_mask: torch.Tensor     # (L,)
     image_token_positions: torch.Tensor  # (n_image_tokens,) long
-    desired_token_id: int
-    other_token_id: int
+    desired_token_ids: list          # all single-token variants of the desired answer (e.g. yes / Yes / " yes" / " Yes")
+    other_token_ids: list            # all single-token variants of the other answer
     weight: float
 
 
@@ -143,6 +144,7 @@ class QwenWMModel:
         # questions / horizons on the same starting image)
         self._last_image_id: int | None = None
         self._last_z_obs: torch.Tensor | None = None  # (obs_horizon, P, D), pre-merger
+        self._last_deepstack: list | None = None      # captured from visual.forward; reused for predicted frames
 
     # ------------------------------------------------------------------ hooks
     def _capture_pre_merger(self, module, inputs):
@@ -160,27 +162,37 @@ class QwenWMModel:
 
     @torch.no_grad()
     def encode_image(self, image: Image.Image) -> torch.Tensor:
-        """Returns (num_patches, emb_dim) pre-merger latent for one image."""
+        """Returns (num_patches, emb_dim) pre-merger latent for one image.
+
+        Side effect: also caches the deepstack features captured during this
+        visual.forward in self._last_deepstack so the LLM can be given the
+        complete visual context downstream.
+        """
         x = self._pil_to_tensor(image).to(self.device).to(self.precision)
-        # Reuse the Qwen3VLViTEncoder patchify logic
-        from models.qwen3_vl import Qwen3VLViTEncoder
-        # We don't have a Qwen3VLViTEncoder instance, but the steps are simple --
-        # inline the patchify so we don't need to load duplicate weights.
         x = (x.unsqueeze(0) - self._mean_b) / self._std_b  # (1, 3, H, W)
         B, C, H, W = x.shape
         T = int(self.full_model.config.vision_config.temporal_patch_size)
         ps = int(self.full_model.config.vision_config.patch_size)
+        m = int(self.full_model.config.vision_config.spatial_merge_size)
         gh, gw = H // ps, W // ps
+        # Match Qwen's image processor patchify order exactly
         x = x.unsqueeze(1).expand(B, T, C, H, W)
-        x = x.reshape(B, T, C, gh, ps, gw, ps)
-        x = x.permute(0, 3, 5, 1, 2, 4, 6).contiguous()
+        x = x.reshape(B, T, C, gh // m, m, ps, gw // m, m, ps)
+        x = x.permute(0, 3, 6, 4, 7, 2, 1, 5, 8).contiguous()
         x = x.reshape(B * gh * gw, T * C * ps * ps)
         thw = torch.tensor([[1, gh, gw]], dtype=torch.long, device=self.device)
         self._pre_merger = None
-        _ = self.visual(x, grid_thw=thw)
+        # Qwen3-VL visual returns (image_embeds_post_merger, deepstack_feature_list).
+        # We capture both: pre_merger via the hook, deepstack via the return value.
+        out = self.visual(x, grid_thw=thw)
+        if isinstance(out, tuple):
+            _, deepstack = out[0], out[1] if len(out) >= 2 else None
+        else:
+            deepstack = None
         pre = self._pre_merger
         self._pre_merger = None
         assert pre is not None
+        self._last_deepstack = deepstack
         return pre.view(gh * gw, -1)  # (num_patches, 1152)
 
     # ------------------------------------------------------------------ predictor rollout
@@ -258,22 +270,24 @@ class QwenWMModel:
         attention_mask = inputs["attention_mask"][0]
         image_positions = (input_ids == self.image_token_id).nonzero(as_tuple=False).squeeze(-1)
 
-        # Yes / No token IDs. We try lowercase first since SWM uses lowercase.
-        # Qwen tokenizers usually have a leading space; "yes" vs " yes" vs "Yes".
-        yes_candidates = [" yes", "yes", " Yes", "Yes"]
-        no_candidates = [" no", "no", " No", "No"]
-        yes_id = self._first_single_token(yes_candidates)
-        no_id = self._first_single_token(no_candidates)
-        desired_id = yes_id if desired_token_str.lower() == "yes" else no_id
-        other_id = no_id if desired_token_str.lower() == "yes" else yes_id
+        # Yes/No token IDs -- gather ALL single-token variants of each side and
+        # sum probability mass at evaluation time. Diagnostic showed Qwen3-VL
+        # actually generates 'yes'/'no' (no leading space, lowercase) so picking
+        # a single ' yes' variant lost the prob mass.
+        yes_variants = [" Yes", " yes", "Yes", "yes"]
+        no_variants = [" No", " no", "No", "no"]
+        yes_ids = self._all_single_tokens(yes_variants)
+        no_ids = self._all_single_tokens(no_variants)
+        desired_ids = yes_ids if desired_token_str.lower() == "yes" else no_ids
+        other_ids = no_ids if desired_token_str.lower() == "yes" else yes_ids
 
         return _PromptInfo(
             text=text,
             input_ids=input_ids,
             attention_mask=attention_mask,
             image_token_positions=image_positions,
-            desired_token_id=desired_id,
-            other_token_id=other_id,
+            desired_token_ids=desired_ids,
+            other_token_ids=other_ids,
             weight=float(weight),
         )
 
@@ -282,8 +296,16 @@ class QwenWMModel:
             ids = self.tokenizer(c, add_special_tokens=False).input_ids
             if len(ids) == 1:
                 return ids[0]
-        # Fall back: use the first id of the first candidate
         return self.tokenizer(candidates[0], add_special_tokens=False).input_ids[0]
+
+    def _all_single_tokens(self, candidates: List[str]) -> list[int]:
+        """Return token ids for every candidate that tokenizes to a single token."""
+        out = []
+        for c in candidates:
+            ids = self.tokenizer(c, add_special_tokens=False).input_ids
+            if len(ids) == 1:
+                out.append(ids[0])
+        return out
 
     # ------------------------------------------------------------------ LLM forward
     def _llm_yes_no_probs(
@@ -291,44 +313,86 @@ class QwenWMModel:
         prompt: _PromptInfo,
         image_embeds_batch: torch.Tensor,  # (B, P_out, D_out)
         gradient: bool,
+        deepstack_override: list | None = None,
     ) -> torch.Tensor:
-        """Returns (B,) probability the model would emit prompt.desired_token_id."""
+        """Returns (B,) probability the model would emit one of prompt.desired_token_ids.
+
+        Goes through the OUTER Qwen3VLModel.forward (not the inner text model)
+        so that M-RoPE position_ids are computed correctly for image tokens and
+        deepstack features are injected at the right LLM layers.
+
+        For each forward, we monkey-patch model.get_image_features to return our
+        pre-computed (image_embeds_batch, deepstack) instead of having it
+        recompute from pixel_values. The outer forward still handles the
+        masked_scatter splice + get_rope_index + deepstack_process internally.
+        """
         B = image_embeds_batch.shape[0]
-        L = prompt.input_ids.shape[0]
         device = self.device
 
-        # Build batched input_ids
-        input_ids = prompt.input_ids.unsqueeze(0).expand(B, -1).to(device)
-        attn = prompt.attention_mask.unsqueeze(0).expand(B, -1).to(device)
-        # Get text-side embeddings
-        embed_layer = self.full_model.get_input_embeddings()
-        with torch.enable_grad() if gradient else torch.no_grad():
-            inputs_embeds = embed_layer(input_ids).to(self.precision)
-            # Splice our image embeddings into the image-token positions
-            img_pos = prompt.image_token_positions.to(device)
-            n_img = img_pos.shape[0]
-            P_out = image_embeds_batch.shape[1]
-            if n_img != P_out:
-                raise ValueError(
-                    f"prompt has {n_img} image tokens but predicted features "
-                    f"have {P_out} patches. Adjust the chat template / image size."
-                )
-            # inputs_embeds shape: (B, L, D)
-            inputs_embeds = inputs_embeds.clone()
-            inputs_embeds[:, img_pos, :] = image_embeds_batch.to(self.precision)
+        input_ids = prompt.input_ids.unsqueeze(0).expand(B, -1).contiguous().to(device)
+        attn = prompt.attention_mask.unsqueeze(0).expand(B, -1).contiguous().to(device)
 
-            # Forward through LLM; Qwen3-VL exposes the language model as
-            # `self.full_model.model.language_model` or `self.full_model.language_model`.
-            lm = getattr(self.full_model.model, "language_model", None) or self.full_model.language_model
-            outputs = lm(inputs_embeds=inputs_embeds, attention_mask=attn)
-            hidden = outputs.last_hidden_state  # (B, L, D)
-            # Logits at the last position predict the FIRST generated token.
-            last_logits = self.full_model.lm_head(hidden[:, -1, :]).float()  # (B, V)
-            # Binary softmax over just yes/no
-            yes_logit = last_logits[:, prompt.desired_token_id]
-            no_logit = last_logits[:, prompt.other_token_id]
-            p_yes = torch.softmax(torch.stack([yes_logit, no_logit], dim=-1), dim=-1)[:, 0]
-        return p_yes
+        P_out = image_embeds_batch.shape[1]
+        n_img = prompt.image_token_positions.shape[0]
+        if n_img != P_out:
+            raise ValueError(
+                f"prompt has {n_img} image tokens but features have {P_out} patches"
+            )
+
+        deepstack = deepstack_override if deepstack_override is not None else self._last_deepstack
+        # Tile per-image image_embeds across batch: (B, P_out, D)
+        # And deepstack per layer: (B*P_out, D)
+        deepstack_batched = None
+        if deepstack is not None:
+            deepstack_batched = []
+            for layer_feat in deepstack:
+                if layer_feat.dim() != 2:
+                    raise ValueError(f"unexpected deepstack feature shape {layer_feat.shape}")
+                tiled = layer_feat.unsqueeze(0).expand(B, -1, -1).reshape(-1, layer_feat.shape[-1])
+                deepstack_batched.append(tiled.to(self.precision))
+
+        # Convert (B, P_out, D) -> list of B tensors of (P_out, D) for the
+        # patched get_image_features return shape.
+        per_image = [image_embeds_batch[b].to(self.precision) for b in range(B)]
+
+        # The image_grid_thw the outer model expects: (B, 3) with [t=1, h=14, w=14] for our 448x448 with merge=2.
+        merge = int(self.full_model.config.vision_config.spatial_merge_size)
+        ps = int(self.full_model.config.vision_config.patch_size)
+        gh_post = self.image_size // ps  # 28 pre-merger
+        # post-merger grid count must satisfy product/merge^2 == P_out
+        # i.e. (gh_post * gh_post) / 4 = 196 -> gh_post=28, post-merge grid 14x14
+        grid_h = gh_post
+        grid_w = gh_post
+        image_grid_thw = torch.tensor(
+            [[1, grid_h, grid_w]], dtype=torch.long, device=device
+        ).expand(B, 3).contiguous()
+        # Dummy pixel_values just so the `if pixel_values is not None` branch fires.
+        dummy_pixels = torch.zeros(1, dtype=self.precision, device=device)
+
+        def patched_get_image_features(pixel_values, image_grid_thw):
+            return tuple(per_image), deepstack_batched
+
+        # Monkey-patch + call + restore
+        orig = self.full_model.model.get_image_features
+        self.full_model.model.get_image_features = patched_get_image_features
+        try:
+            with torch.enable_grad() if gradient else torch.no_grad():
+                outputs = self.full_model.model(
+                    input_ids=input_ids,
+                    attention_mask=attn,
+                    pixel_values=dummy_pixels,
+                    image_grid_thw=image_grid_thw,
+                )
+                hidden = outputs.last_hidden_state
+                last_logits = self.full_model.lm_head(hidden[:, -1, :]).float()
+        finally:
+            self.full_model.model.get_image_features = orig
+
+        probs = torch.softmax(last_logits, dim=-1)
+        yes_mass = probs[:, prompt.desired_token_ids].sum(dim=-1)
+        no_mass = probs[:, prompt.other_token_ids].sum(dim=-1)
+        total = yes_mass + no_mass
+        return yes_mass / total.clamp_min(1e-12)
 
     # ------------------------------------------------------------------ public API
     def get_probabilistic_rewards_wm(
