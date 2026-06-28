@@ -1,0 +1,66 @@
+defaults:
+  - _self_
+
+# Mirrors swms/configs/eval_gradient_full.yaml task list / seed sweep / planner
+# settings, swapping the SWMGradModel checkpoint for our QwenWMModel.
+
+name: "qwen_langtable"
+
+device: "cuda:0"
+deterministic: true
+
+image_size: 448
+obs_horizon: 2
+max_action_horizon: 16
+
+paths:
+  root_save_path: ${oc.env:DINO_WM_QWEN_EVAL_ROOT,${hydra:runtime.cwd}/outputs_qwen_eval}
+  predictor_ckpt_path: ${oc.env:PREDICTOR_CKPT}
+  qwen_model_id: "Qwen/Qwen3-VL-8B-Instruct"
+
+seed_start: 6000
+num_seeds: 50
+env_type: "lang_table"
+goal_type: "block_to_block"
+
+# Same 5 tasks SWM uses for the gradient_full headline.
+tasks:
+  - block_combo: ["green_cube", "blue_moon"]
+    diffusion_path: ${oc.env:SWMS_REPO}/ckpts/lt_base_diffusion/green_cube_blue_moon.pt
+  - block_combo: ["red_moon", "green_star"]
+    diffusion_path: ${oc.env:SWMS_REPO}/ckpts/lt_base_diffusion/red_moon_green_star.pt
+  - block_combo: ["red_pentagon", "blue_moon"]
+    diffusion_path: ${oc.env:SWMS_REPO}/ckpts/lt_base_diffusion/red_pentagon_blue_moon.pt
+  - block_combo: ["yellow_pentagon", "red_moon"]
+    diffusion_path: ${oc.env:SWMS_REPO}/ckpts/lt_base_diffusion/yellow_pentagon_red_moon.pt
+  - block_combo: ["yellow_star", "blue_cube"]
+    diffusion_path: ${oc.env:SWMS_REPO}/ckpts/lt_base_diffusion/yellow_star_blue_cube.pt
+
+planning:
+  planning_name: "gradient_full"
+  diffusion: true
+  mppi: false
+  gradient: true
+  expert_diffusion: false
+
+  num_steps: 60
+  num_actions_executed: 2
+  action_skip: 8
+  pred_horizon: 16
+  num_samples: 1
+  num_planning_iters: 10
+
+  gradient_lr: 0.02
+  gradient_clipping_value: 1.0
+
+  mppi_temperature: 1.0
+
+model_batch_size: 16
+action_dim: 2
+intermediate_hm: false
+
+hydra:
+  job:
+    chdir: true
+  run:
+    dir: ${paths.root_save_path}/${now:%Y-%m-%d_%H-%M-%S}_${name}

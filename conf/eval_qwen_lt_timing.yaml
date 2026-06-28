@@ -1,0 +1,13 @@
+defaults:
+  - eval_qwen_lt
+  - _self_
+
+# 1 task x 1 seed at FULL planner settings — used to measure per-seed wallclock
+# so we can size the headline job correctly.
+name: "qwen_langtable_timing"
+seed_start: 6000
+num_seeds: 1
+
+tasks:
+  - block_combo: ["green_cube", "blue_moon"]
+    diffusion_path: ${oc.env:SWMS_REPO}/ckpts/lt_base_diffusion/green_cube_blue_moon.pt

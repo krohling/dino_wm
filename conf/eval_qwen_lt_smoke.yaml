@@ -1,0 +1,30 @@
+defaults:
+  - eval_qwen_lt
+
+# Minimal smoke: 1 task x 2 seeds, short MPC.
+name: "qwen_langtable_smoke"
+
+seed_start: 6000
+num_seeds: 2
+
+tasks:
+  - block_combo: ["green_cube", "blue_moon"]
+    diffusion_path: ${oc.env:SWMS_REPO}/ckpts/lt_base_diffusion/green_cube_blue_moon.pt
+
+planning:
+  planning_name: "gradient_smoke"
+  diffusion: true
+  mppi: false
+  gradient: true
+  expert_diffusion: false
+  num_steps: 5
+  num_actions_executed: 2
+  action_skip: 8
+  pred_horizon: 16
+  num_samples: 1
+  num_planning_iters: 3
+  gradient_lr: 0.02
+  gradient_clipping_value: 1.0
+  mppi_temperature: 1.0
+
+model_batch_size: 8
