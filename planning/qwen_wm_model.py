@@ -124,7 +124,11 @@ class QwenWMModel:
         missing, unexpected = self.predictor.load_state_dict(ckpt["predictor"], strict=False)
         if missing or unexpected:
             log.warning(f"predictor load: missing={missing[:3]} unexpected={unexpected[:3]}")
-        self.predictor = self.predictor.to(device).to(precision).eval()
+        # Keep the predictor in fp32: it was TRAINED in fp32 (encoder wrapper
+        # returned .float()), and its task-relevant signal (deviation from
+        # copy-last-frame, ~0.5% in cosine terms) is the same order as bf16's
+        # ~0.4% relative resolution. bf16 here would quantize away the signal.
+        self.predictor = self.predictor.to(device).float().eval()
         for p in self.predictor.parameters():
             p.requires_grad = False
 
@@ -143,10 +147,15 @@ class QwenWMModel:
         self.visual.merger.register_forward_pre_hook(self._capture_pre_merger)
 
         # Cache for the most recent encoded image (the planner queries multiple
-        # questions / horizons on the same starting image)
-        self._last_image_id: int | None = None
+        # questions / horizons on the same starting image). Keyed on image
+        # CONTENT (not id()!) -- Python recycles object addresses, so id()-based
+        # caching silently returns stale encodings across MPC steps.
+        self._last_image_key: int | None = None
         self._last_z_obs: torch.Tensor | None = None  # (obs_horizon, P, D), pre-merger
         self._last_deepstack: list | None = None      # captured from visual.forward; reused for predicted frames
+        # Rolling previous-frame latent for real 2-frame history within an
+        # episode (predictor trained with (frame_{t-1}, frame_t), never dupes).
+        self._prev_z0: torch.Tensor | None = None
 
     # ------------------------------------------------------------------ hooks
     def _capture_pre_merger(self, module, inputs):
@@ -236,8 +245,9 @@ class QwenWMModel:
         action_mask: torch.Tensor,       # (B, H_max) bool
     ) -> torch.Tensor:
         B = actions_padded.shape[0]
-        z_obs = z_history.unsqueeze(0).expand(B, -1, -1, -1).contiguous()
-        return self.predictor(z_obs, actions_padded, action_mask=action_mask)
+        # Predictor runs in fp32 (see __init__); cast inputs accordingly.
+        z_obs = z_history.float().unsqueeze(0).expand(B, -1, -1, -1).contiguous()
+        return self.predictor(z_obs, actions_padded.float(), action_mask=action_mask)
 
     # ------------------------------------------------------------------ merger
     def _merge(self, pre_merger_batch: torch.Tensor) -> torch.Tensor:
@@ -384,7 +394,15 @@ class QwenWMModel:
         # Dummy pixel_values just so the `if pixel_values is not None` branch fires.
         dummy_pixels = torch.zeros(1, dtype=self.precision, device=device)
 
-        def patched_get_image_features(pixel_values, image_grid_thw):
+        def patched_get_image_features(*args, **kwargs):
+            # transformers 5.x calls with return_dict=True and reads
+            # .pooler_output / .deepstack_features; 4.x expects a tuple.
+            if kwargs.get("return_dict", False):
+                import types
+                return types.SimpleNamespace(
+                    pooler_output=tuple(per_image),
+                    deepstack_features=deepstack_batched,
+                )
             return tuple(per_image), deepstack_batched
 
         # Monkey-patch + call + restore
@@ -410,6 +428,15 @@ class QwenWMModel:
         return yes_mass / total.clamp_min(1e-12)
 
     # ------------------------------------------------------------------ public API
+    def reset_episode(self):
+        """Clear cross-frame state. Call between episodes/seeds so the
+        previous episode's final frame doesn't leak into the new episode's
+        history slot."""
+        self._last_image_key = None
+        self._last_z_obs = None
+        self._prev_z0 = None
+        self._last_deepstack = None
+
     def get_probabilistic_rewards_wm(
         self,
         action_seq: torch.Tensor | np.ndarray,
@@ -433,9 +460,9 @@ class QwenWMModel:
         """
         if isinstance(action_seq, np.ndarray):
             action_seq = torch.from_numpy(action_seq)
-        action_seq = action_seq.to(self.device, dtype=self.precision)
-        if gradient:
-            action_seq.requires_grad_(True)
+        # fp32 all the way to the predictor (which runs fp32); .to() keeps the
+        # autograd connection to the planner's CPU leaf tensor.
+        action_seq = action_seq.to(self.device, dtype=torch.float32)
         N, T_full, A = action_seq.shape
         assert A == self.action_dim, (A, self.action_dim)
         assert T_full <= self.max_action_horizon, (
@@ -443,16 +470,20 @@ class QwenWMModel:
             f"{self.max_action_horizon}; planner config and predictor must agree"
         )
 
-        # --- 1. Encode current image, build 2-frame history (frame_{-1} = frame_0) ---
-        image_id = id(image)
-        if image_id != self._last_image_id:
+        # --- 1. Encode current image, build 2-frame history ---
+        # Cache key = image CONTENT hash. id(image) is unsafe: the MPC loop
+        # allocates a fresh PIL Image every outer step and CPython recycles
+        # the freed address, so id() collides and returns stale features.
+        image_key = hash(image.tobytes())
+        if image_key != self._last_image_key:
             z_0 = self.encode_image(image)  # (P, D), pre-merger
-            # No real past frame available -> repeat current as the "previous" obs.
-            # This matches the labeler-eval convention and is what SWM does too
-            # at the start of a plan.
-            z_hist = torch.stack([z_0, z_0], dim=0)  # (obs_horizon=2, P, D)
-            self._last_z_obs = z_hist
-            self._last_image_id = image_id
+            # Use the PREVIOUS frame's latent as history slot 0 when we have
+            # one (matches training: history is (frame_{t-1}, frame_t)).
+            # Fall back to duplication only at episode start.
+            prev = self._prev_z0 if self._prev_z0 is not None else z_0
+            self._last_z_obs = torch.stack([prev, z_0], dim=0)  # (2, P, D)
+            self._prev_z0 = z_0
+            self._last_image_key = image_key
         z_history = self._last_z_obs  # (2, P, D)
 
         # --- 2. Normalize actions and build padded tensors for each h_step ---
@@ -463,9 +494,9 @@ class QwenWMModel:
         # Pre-cache per-question prompts
         prompt_infos = [self._build_prompt_info(q) for q in questions]
 
-        action_mean = self.action_mean.view(1, 1, -1).to(self.precision)
-        action_std = self.action_std.view(1, 1, -1).to(self.precision)
-        action_norm_full = (action_seq - action_mean) / action_std  # (N, T_full, A)
+        action_mean = self.action_mean.view(1, 1, -1).float()
+        action_std = self.action_std.view(1, 1, -1).float()
+        action_norm_full = (action_seq - action_mean) / action_std  # (N, T_full, A) fp32
 
         # Build a single big batch of (a_idx, h_step) -> z_pred
         # Each row is one action prefix of length h_step, padded to H_max.
@@ -474,7 +505,7 @@ class QwenWMModel:
         big_meta: List[Tuple[int, int]] = []
         for h_step in h_steps:
             for a_idx in range(N):
-                pad = torch.zeros(H_max, A, dtype=self.precision, device=self.device)
+                pad = torch.zeros(H_max, A, dtype=torch.float32, device=self.device)
                 prefix = action_norm_full[a_idx, :h_step]
                 pad[:h_step] = prefix
                 mask = torch.zeros(H_max, dtype=torch.bool, device=self.device)
@@ -487,18 +518,18 @@ class QwenWMModel:
         M = big_a_t.shape[0]
         log.debug(f"predictor batch M={M}  N={N}  h_steps={h_steps}")
 
-        rewards_with_grad_sum = torch.zeros((), device=self.device, dtype=self.precision)
+        rewards_with_grad_sum = torch.zeros((), device=self.device, dtype=torch.float32)
         ctx = contextlib.nullcontext() if gradient else torch.no_grad()
-        # --- 3. Predict latents in chunks ---
+        # --- 3. Predict latents in chunks (fp32 predictor) ---
         z_preds_all = []
         with ctx:
             for s in range(0, M, batch_size):
                 e = min(s + batch_size, M)
                 z_pred = self._predict_with_mask(z_history, big_a_t[s:e], big_mask_t[s:e])
                 z_preds_all.append(z_pred)
-            z_preds = torch.cat(z_preds_all, dim=0)  # (M, P, D_in)
-            # --- 4. Project to post-merger image embeddings ---
-            img_embeds = self._merge(z_preds)  # (M, P_out, D_out)
+            z_preds = torch.cat(z_preds_all, dim=0)  # (M, P, D_in) fp32
+            # --- 4. Project to post-merger image embeddings (merger is bf16) ---
+            img_embeds = self._merge(z_preds.to(self.precision))  # (M, P_out, D_out)
 
             # --- 5. Score each prompt for each (a_idx, h_step) ---
             for q_idx, prompt in enumerate(prompt_infos):

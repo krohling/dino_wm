@@ -76,6 +76,10 @@ def run(cfg: DictConfig):
 
     planning_cfg = cfg.planning
     tasks = _resolve_tasks(cfg)
+    # Optional: pick a single task by index (used by SLURM array runs).
+    if cfg.get("task_idx", None) is not None:
+        tasks = [tasks[int(cfg.task_idx)]]
+        print(f"task_idx={cfg.task_idx}: running only {tasks[0]['block_combo']}")
 
     device = cfg.get("device", "cuda")
 
@@ -114,6 +118,10 @@ def run(cfg: DictConfig):
                 "block_combo": block_combo,
                 "ood": cfg.get("ood", False),
             }
+
+            # Clear the adapter's cross-frame state (frame cache + rolling
+            # 2-frame history) so nothing leaks between episodes.
+            model.reset_episode()
 
             success, time_taken = swm_eval(
                 seed=seed,

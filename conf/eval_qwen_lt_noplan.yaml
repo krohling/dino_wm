@@ -1,0 +1,27 @@
+defaults:
+  - eval_qwen_lt
+  - _self_
+
+# Sanity check: gradient_lr=0 keeps every step of the full eval intact --
+# WM forwards, autograd, .backward() -- but SGD steps with lr=0 don't mutate
+# the action tensor. Planner returns the initial diffusion proposal.
+# Expected SR: matches base diffusion baseline (~21% overall on LT).
+# If SR much lower, some part of the WM code path silently corrupts state
+# even before gradient updates are applied.
+name: "qwen_langtable_noplan"
+
+planning:
+  planning_name: "gradient_lr0"
+  diffusion: true
+  mppi: false
+  gradient: true
+  expert_diffusion: false
+  num_steps: 60
+  num_actions_executed: 2
+  action_skip: 8
+  pred_horizon: 16
+  num_samples: 1
+  num_planning_iters: 10
+  gradient_lr: 0.0             # <-- the whole point: never mutate actions
+  gradient_clipping_value: 1.0
+  mppi_temperature: 1.0
