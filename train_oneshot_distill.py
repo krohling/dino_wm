@@ -97,7 +97,16 @@ class DistillDataset(SWMOneShotDataset):
         target_frame = t_start + H
         entries = self.teacher.entries(ep_id, target_frame) if self.teacher else []
         if entries:
-            e = entries[self._rng.integers(len(entries))]
+            # Teacher answers are ~77% "no"; unbalanced sampling collapses the
+            # student to constant-no (observed: yes-recall 0.05 by epoch 2).
+            # Draw from the teacher-yes pool half the time when possible.
+            yes_pool = [e for e in entries if e["p_yes"] >= 0.5]
+            no_pool = [e for e in entries if e["p_yes"] < 0.5]
+            if yes_pool and (not no_pool or self._rng.random() < 0.5):
+                pool = yes_pool
+            else:
+                pool = no_pool or yes_pool
+            e = pool[self._rng.integers(len(pool))]
             item["question"] = e["q"]
             item["teacher_p_yes"] = torch.tensor(float(e["p_yes"]), dtype=torch.float32)
             item["has_teacher"] = torch.tensor(True)
