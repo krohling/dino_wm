@@ -15,9 +15,19 @@ import json
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence
 
+import io
+
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+
+
+def _decode_jpeg(buf: bytes) -> torch.Tensor:
+    """JPEG bytes -> (3, H, W) float tensor in [0, 1]."""
+    from PIL import Image
+    with Image.open(io.BytesIO(buf)) as im:
+        arr = np.asarray(im.convert("RGB"), dtype=np.uint8)
+    return torch.from_numpy(arr).permute(2, 0, 1).float() / 255.0
 
 
 class SWMOneShotDataset(Dataset):
@@ -56,14 +66,19 @@ class SWMOneShotDataset(Dataset):
         self.episodes = eps
         self.action_dim = int(eps[0]["action_dim"])
 
-        # Load everything to RAM (small: 232 episodes x ~30MB = ~7 GB on Vista).
+        # Load everything to RAM. Two on-disk frame formats are supported:
+        #   - raw:  frames = uint8 tensor (T, 3, S, S)      (original format)
+        #   - jpeg: frames = list[bytes], each a JPEG image (compressed format,
+        #           ~10x smaller; decoded lazily in _get_frame)
         self._cache: list[dict] = []
         for e in eps:
-            d = torch.load(self.data_path / e["filename"], map_location="cpu", weights_only=True)
+            d = torch.load(self.data_path / e["filename"], map_location="cpu", weights_only=False)
+            frames = d["frames"]
+            length = len(frames) if isinstance(frames, list) else int(frames.shape[0])
             self._cache.append({
-                "frames": d["frames"],   # uint8 (T, 3, S, S)
+                "frames": frames,
                 "actions": d["actions"], # f32  (T, A)
-                "length": int(d["frames"].shape[0]),
+                "length": length,
             })
 
         # Build sample index: list of (ep_idx, t_start) valid starts.
@@ -134,15 +149,20 @@ class SWMOneShotDataset(Dataset):
             H = int(rng.integers(low=1, high=cap + 1))  # high is exclusive
 
         c = self._cache[ep_idx]
-        frames_u8 = c["frames"]   # uint8 (T, 3, S, S)
+        frames_u8 = c["frames"]   # uint8 tensor (T, 3, S, S) OR list of JPEG bytes
         actions = c["actions"]    # f32  (T, A)
 
         # History: frames[t_start - obs_horizon + 1 .. t_start] inclusive
         hist_start = t_start - self.obs_horizon + 1
-        history = frames_u8[hist_start : t_start + 1].float() / 255.0  # (obs_horizon, 3, S, S)
-
-        # Target: frame at t_start + H
-        target = frames_u8[t_start + H].float() / 255.0  # (3, S, S)
+        if isinstance(frames_u8, list):
+            # JPEG-compressed storage: decode only the frames this sample needs.
+            history = torch.stack(
+                [_decode_jpeg(frames_u8[t]) for t in range(hist_start, t_start + 1)], dim=0
+            )
+            target = _decode_jpeg(frames_u8[t_start + H])
+        else:
+            history = frames_u8[hist_start : t_start + 1].float() / 255.0  # (obs_horizon, 3, S, S)
+            target = frames_u8[t_start + H].float() / 255.0  # (3, S, S)
 
         # Actions: actions[t_start .. t_start + H - 1], normalized, padded to max
         act_slice = actions[t_start : t_start + H]
