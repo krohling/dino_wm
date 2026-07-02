@@ -45,6 +45,59 @@ def _frame_to_pil(frame) -> Image.Image:
     return Image.fromarray(frame.permute(1, 2, 0).numpy())
 
 
+@torch.no_grad()
+def encode_frames_batched(wm, pils, batch_size=16):
+    """Encode a list of PIL frames through the visual model in batches.
+
+    Returns (embeds, deepstacks): embeds[i] is (P_out, D) post-merger;
+    deepstacks[i] is the per-frame list of (P_out, D) deepstack features.
+    Matches wm.encode_image + wm._merge output exactly (asserted by caller
+    on the first episode).
+    """
+    S = wm.image_size
+    T_p = int(wm.full_model.config.vision_config.temporal_patch_size)
+    ps = int(wm.full_model.config.vision_config.patch_size)
+    m = int(wm.full_model.config.vision_config.spatial_merge_size)
+    gh = gw = S // ps
+    P_out = (gh // m) * (gw // m) * (m * m) // (m * m) * (m * m)  # not used; kept simple below
+
+    embeds, deepstacks = [], []
+    for s in range(0, len(pils), batch_size):
+        chunk = pils[s : s + batch_size]
+        B = len(chunk)
+        arrs = [np.asarray(p.convert("RGB"), dtype=np.uint8) for p in chunk]
+        x = torch.from_numpy(np.stack(arrs)).permute(0, 3, 1, 2).float().div_(255.0)
+        x = x.to(wm.device).to(wm.precision)
+        x = (x - wm._mean_b) / wm._std_b
+        x = x.unsqueeze(1).expand(B, T_p, 3, S, S)
+        x = x.reshape(B, T_p, 3, gh // m, m, ps, gw // m, m, ps)
+        x = x.permute(0, 3, 6, 4, 7, 2, 1, 5, 8).contiguous()
+        x = x.reshape(B * gh * gw, T_p * 3 * ps * ps)
+        thw = torch.tensor([[1, gh, gw]] * B, dtype=torch.long, device=wm.device)
+        out = wm.visual(x, grid_thw=thw)
+        if isinstance(out, tuple):
+            post, ds = out[0], (out[1] if len(out) >= 2 else None)
+        else:
+            post = getattr(out, "pooler_output", None)
+            if post is None:
+                post = out.last_hidden_state
+            ds = getattr(out, "deepstack_features", None)
+        # post: (B*P_out, D_out) -> split per frame
+        n_out = post.shape[0] // B
+        post = post.reshape(B, n_out, post.shape[-1])
+        if ds is not None:
+            ds_per_frame = [
+                [layer.reshape(B, n_out, layer.shape[-1])[b] for layer in ds]
+                for b in range(B)
+            ]
+        else:
+            ds_per_frame = [None] * B
+        for b in range(B):
+            embeds.append(post[b])
+            deepstacks.append(ds_per_frame[b])
+    return embeds, deepstacks
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data-path", required=True)
@@ -79,6 +132,7 @@ def main():
 
     t0 = time.time()
     total = 0
+    batched_verified = False
     for ei, ep in enumerate(episodes):
         ep_id = ep["id"]
         out_path = out_dir / f"{ep_id}.json"
@@ -92,13 +146,24 @@ def main():
         frames = d["frames"]
         T = len(frames) if isinstance(frames, list) else frames.shape[0]
 
-        # 1. Encode all frames once, keep post-merger embeds + per-frame deepstack
-        embeds, deepstacks = [], []
-        for t in range(T):
-            img = _frame_to_pil(frames[t])
-            z = wm.encode_image(img)
-            embeds.append(wm._merge(z.unsqueeze(0))[0])
-            deepstacks.append(wm._last_deepstack)
+        # 1. Encode all frames once (batched), keep post-merger + per-frame deepstack
+        pils = [_frame_to_pil(frames[t]) for t in range(T)]
+        embeds, deepstacks = encode_frames_batched(wm, pils, batch_size=16)
+
+        # Self-test on the first processed episode: batched must match the
+        # sequential path bit-for-bit-ish (bf16 tolerance).
+        if not batched_verified:
+            z0 = wm.encode_image(pils[0])
+            ref = wm._merge(z0.unsqueeze(0))[0]
+            cos = torch.nn.functional.cosine_similarity(
+                ref.float().flatten(), embeds[0].float().flatten(), dim=0
+            ).item()
+            print(f"batched-vs-sequential encode cosine: {cos:.6f}", flush=True)
+            if cos < 0.999:
+                raise RuntimeError(
+                    f"batched encode mismatch (cos={cos:.4f}); refusing to proceed"
+                )
+            batched_verified = True
 
         # 2. Subsample: one question per type per frame (up to questions_per_frame)
         results = [[] for _ in range(T)]
