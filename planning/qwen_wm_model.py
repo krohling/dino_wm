@@ -54,6 +54,7 @@ class _PromptInfo:
     desired_token_ids: list          # all single-token variants of the desired answer (e.g. yes / Yes / " yes" / " Yes")
     other_token_ids: list            # all single-token variants of the other answer
     weight: float
+    mm_token_type_ids: torch.Tensor | None = None  # (L,) -- required by transformers>=5 for M-RoPE
 
 
 class QwenWMModel:
@@ -288,11 +289,21 @@ class QwenWMModel:
         chat_str = self.processor.apply_chat_template(
             messages, add_generation_prompt=True, tokenize=False
         )
-        inputs = self.processor(
-            text=[chat_str], images=[dummy_img], return_tensors="pt", padding=False,
-        )
+        # transformers>=5 needs mm_token_type_ids for M-RoPE; ask the processor
+        # for them (older processors ignore the kwarg or omit the key).
+        try:
+            inputs = self.processor(
+                text=[chat_str], images=[dummy_img], return_tensors="pt", padding=False,
+                return_mm_token_type_ids=True,
+            )
+        except TypeError:
+            inputs = self.processor(
+                text=[chat_str], images=[dummy_img], return_tensors="pt", padding=False,
+            )
         input_ids = inputs["input_ids"][0]
         attention_mask = inputs["attention_mask"][0]
+        mm_tti = inputs.get("mm_token_type_ids")
+        mm_token_type_ids = mm_tti[0] if mm_tti is not None else None
         image_positions = (input_ids == self.image_token_id).nonzero(as_tuple=False).squeeze(-1)
 
         # Yes/No token IDs -- gather ALL single-token variants of each side and
@@ -314,6 +325,7 @@ class QwenWMModel:
             desired_token_ids=desired_ids,
             other_token_ids=other_ids,
             weight=float(weight),
+            mm_token_type_ids=mm_token_type_ids,
         )
 
     def _first_single_token(self, candidates: List[str]) -> int:
@@ -405,6 +417,13 @@ class QwenWMModel:
                 )
             return tuple(per_image), deepstack_batched
 
+        # transformers>=5 needs mm_token_type_ids for M-RoPE
+        extra_kwargs = {}
+        if prompt.mm_token_type_ids is not None:
+            extra_kwargs["mm_token_type_ids"] = (
+                prompt.mm_token_type_ids.unsqueeze(0).expand(B, -1).contiguous().to(device)
+            )
+
         # Monkey-patch + call + restore
         orig = self.full_model.model.get_image_features
         self.full_model.model.get_image_features = patched_get_image_features
@@ -415,6 +434,7 @@ class QwenWMModel:
                     attention_mask=attn,
                     pixel_values=dummy_pixels,
                     image_grid_thw=image_grid_thw,
+                    **extra_kwargs,
                 )
                 hidden = outputs.last_hidden_state
                 last_logits = self.full_model.lm_head(hidden[:, -1, :]).float()
