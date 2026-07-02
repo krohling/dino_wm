@@ -207,11 +207,16 @@ class QwenWMModel:
         x = x.reshape(B * gh * gw, T * C * ps * ps)
         thw = torch.tensor([[1, gh, gw]], dtype=torch.long, device=self.device)
         self._pre_merger = None
-        # Qwen3-VL visual returns (image_embeds_post_merger, deepstack_feature_list).
-        # We capture both: pre_merger via the hook, deepstack via the return value.
+        # Capture pre_merger via the hook and deepstack via the return value.
+        # transformers 4.x: visual() returns a tuple (embeds, deepstack_list).
+        # transformers 5.x: returns BaseModelOutputWithDeepstackFeatures
+        # (.pooler_output / .deepstack_features). The old isinstance(tuple)
+        # check silently dropped deepstack on 5.x.
         out = self.visual(x, grid_thw=thw)
         if isinstance(out, tuple):
-            _, deepstack = out[0], out[1] if len(out) >= 2 else None
+            deepstack = out[1] if len(out) >= 2 else None
+        elif hasattr(out, "deepstack_features"):
+            deepstack = out.deepstack_features
         else:
             deepstack = None
         pre = self._pre_merger
