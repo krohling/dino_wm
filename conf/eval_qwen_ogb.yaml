@@ -1,0 +1,61 @@
+defaults:
+  - _self_
+
+# OGB planning eval with QwenWMModel, mirroring swms eval_gradient_full_ogbench
+# (SWM's OGB hyperparams: lr=0.2, 20 iters, clip 10, execute 4/16).
+
+name: "qwen_ogbench"
+
+device: "cuda:0"
+deterministic: true
+
+image_size: 448
+obs_horizon: 2
+max_action_horizon: 16
+
+paths:
+  root_save_path: ${oc.env:DINO_WM_QWEN_EVAL_ROOT,${hydra:runtime.cwd}/outputs_qwen_eval}
+  predictor_ckpt_path: ${oc.env:PREDICTOR_CKPT}
+  qwen_model_id: "Qwen/Qwen3-VL-8B-Instruct"
+
+seed_start: 6000
+num_seeds: 25
+env_type: "ogbench"
+goal_type: "stack_blocks"
+
+tasks:
+  - block_combo: ["blue_cube", "green_cube"]
+    diffusion_path: ${oc.env:SWMS_REPO}/ckpts/ogbench_base_diffusion/blue_cube_green_cube.pt
+  - block_combo: ["blue_cube", "yellow_cube"]
+    diffusion_path: ${oc.env:SWMS_REPO}/ckpts/ogbench_base_diffusion/blue_cube_yellow_cube.pt
+  - block_combo: ["yellow_cube", "red_cube"]
+    diffusion_path: ${oc.env:SWMS_REPO}/ckpts/ogbench_base_diffusion/yellow_cube_red_cube.pt
+
+planning:
+  planning_name: "gradient_full"
+  diffusion: true
+  mppi: false
+  gradient: true
+  expert_diffusion: false
+
+  num_steps: 50
+  num_actions_executed: 4
+  action_skip: 8
+  pred_horizon: 16
+  num_samples: 1
+  num_planning_iters: 20
+
+  gradient_lr: 0.2
+  gradient_clipping_value: 10.0
+
+  mppi_temperature: 1.0
+
+model_batch_size: 16
+action_dim: 5
+intermediate_hm: false
+
+hydra:
+  job:
+    chdir: true
+  run:
+    dir: ${paths.root_save_path}/${now:%Y-%m-%d_%H-%M-%S}_${name}

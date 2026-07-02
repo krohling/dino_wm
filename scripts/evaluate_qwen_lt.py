@@ -32,6 +32,13 @@ from tqdm.auto import tqdm
 # swms imports (eval loop + planner + env wrappers)
 from swm.evaluation import eval as swm_eval
 
+# Importing ogbench registers the visual-cube-* gym envs (needed when
+# env_type=ogbench; harmless for lang_table).
+try:
+    import ogbench  # noqa: F401
+except ImportError:
+    pass
+
 # Our adapter
 from planning.qwen_wm_model import QwenWMModel
 
