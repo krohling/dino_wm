@@ -383,8 +383,12 @@ def main(cfg: DictConfig):
                            "epoch": epoch}, step=global_step)
 
         # ---- validation: cosine metrics + teacher agreement on real-frame logits
+        # Teacher answers are ~77% "no" (blocks mostly aren't touching/stacked),
+        # so raw agreement is skew-blind: constant-NO scores 77.5%. We report
+        # per-side agreement and select best on the BALANCED mean.
         model.eval()
-        v_cos = v_agree = v_n = v_tn = 0
+        v_cos = v_n = 0
+        agree_yes = n_yes = agree_no = n_no = 0
         with torch.no_grad():
             for batch in val_loader:
                 history = batch["history"].to(device); actions = batch["actions"].to(device)
@@ -401,18 +405,30 @@ def main(cfg: DictConfig):
                             idx_by_q[q].append(i)
                     for q, idxs in idx_by_q.items():
                         p_yes = head.p_yes(head._prompt(q), img_embeds[idxs])
-                        agree = ((p_yes >= 0.5) == (teacher_p[idxs] >= 0.5)).sum()
-                        v_agree += int(agree); v_tn += len(idxs)
+                        t_yes = teacher_p[idxs] >= 0.5
+                        s_yes = p_yes >= 0.5
+                        agree_yes += int(((s_yes == t_yes) & t_yes).sum())
+                        n_yes += int(t_yes.sum())
+                        agree_no += int(((s_yes == t_yes) & ~t_yes).sum())
+                        n_no += int((~t_yes).sum())
 
         val_cos = v_cos / max(1, v_n)
-        val_agree = v_agree / max(1, v_tn)
+        acc_yes = agree_yes / max(1, n_yes)
+        acc_no = agree_no / max(1, n_no)
+        val_agree_bal = (acc_yes + acc_no) / 2
+        val_agree_raw = (agree_yes + agree_no) / max(1, n_yes + n_no)
         dt = time.time() - t0
         log.info(f"Epoch {epoch}  loss={run_loss/max(1,n_seen):.4f}  cos={run_cos/max(1,n_seen):.4f}  "
                  f"bce={run_bce/max(1,n_seen):.4f}  val_cos={val_cos:.4f}  "
-                 f"val_teacher_agree={val_agree:.3f} ({v_tn} q)  dt={dt:.0f}s")
+                 f"agree_bal={val_agree_bal:.3f} (yes={acc_yes:.3f} n={n_yes}, no={acc_no:.3f} n={n_no})  "
+                 f"raw={val_agree_raw:.3f}  dt={dt:.0f}s")
         wandb.log({"epoch_summary/val_cos_sim": val_cos,
-                   "epoch_summary/val_teacher_agree": val_agree,
+                   "epoch_summary/val_teacher_agree_balanced": val_agree_bal,
+                   "epoch_summary/val_teacher_agree_raw": val_agree_raw,
+                   "epoch_summary/val_agree_yes": acc_yes,
+                   "epoch_summary/val_agree_no": acc_no,
                    "epoch_summary/epoch_time_s": dt, "epoch": epoch}, step=global_step)
+        val_agree = val_agree_bal  # best-model selection keys on balanced
 
         ckpt = {"epoch": epoch, "predictor": predictor.state_dict(),
                 "action_mean": train_ds.action_mean, "action_std": train_ds.action_std,
