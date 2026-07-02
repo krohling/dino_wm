@@ -1,0 +1,43 @@
+defaults:
+  - _self_
+  - encoder: qwen3_vl
+  - predictor: vit_oneshot
+
+data_path: ${oc.env:DATASET_DIR}/ogb
+
+seed: 0
+img_size: 448
+obs_horizon: 2
+max_action_horizon: 16
+eval_horizons: [1, 2, 4, 8, 16]
+split_ratio: 0.9
+normalize_action: true
+
+# Optional path to a cosine-pretrained predictor checkpoint to fine-tune from.
+init_from: null
+
+distill:
+  cos_weight: 1.0
+  kl_weight: 1.0
+
+training:
+  epochs: 20
+  batch_size: 8
+  val_batch_size: 8
+  num_workers: 4
+  lr: 2e-4
+  weight_decay: 0.01
+  grad_clip: 1.0
+  log_every: 10
+  save_every: 5
+
+wandb:
+  project: swm-next-dino-wm
+  entity: kevin_ai
+  name: null
+
+hydra:
+  job:
+    chdir: true
+  run:
+    dir: ${oc.env:DINO_WM_RUN_BASE,./oneshot_runs}/${now:%Y-%m-%d_%H-%M-%S}_distill
