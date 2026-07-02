@@ -382,16 +382,25 @@ class QwenWMModel:
             )
 
         deepstack = deepstack_override if deepstack_override is not None else self._last_deepstack
-        # Tile per-image image_embeds across batch: (B, P_out, D)
-        # And deepstack per layer: (B*P_out, D)
+        # Deepstack per layer must end up (B*P_out, D). Two accepted inputs:
+        #   (P_out, D)    -- single-frame features, tile across the batch
+        #   (B*P_out, D)  -- caller already concatenated per-frame features
         deepstack_batched = None
         if deepstack is not None:
             deepstack_batched = []
             for layer_feat in deepstack:
                 if layer_feat.dim() != 2:
                     raise ValueError(f"unexpected deepstack feature shape {layer_feat.shape}")
-                tiled = layer_feat.unsqueeze(0).expand(B, -1, -1).reshape(-1, layer_feat.shape[-1])
-                deepstack_batched.append(tiled.to(self.precision))
+                if layer_feat.shape[0] == P_out:
+                    feat = layer_feat.unsqueeze(0).expand(B, -1, -1).reshape(-1, layer_feat.shape[-1])
+                elif layer_feat.shape[0] == B * P_out:
+                    feat = layer_feat
+                else:
+                    raise ValueError(
+                        f"deepstack rows {layer_feat.shape[0]} matches neither "
+                        f"P_out={P_out} nor B*P_out={B * P_out}"
+                    )
+                deepstack_batched.append(feat.to(self.precision))
 
         # Convert (B, P_out, D) -> list of B tensors of (P_out, D) for the
         # patched get_image_features return shape.
