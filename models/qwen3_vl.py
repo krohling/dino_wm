@@ -60,7 +60,8 @@ class Qwen3VLViTEncoder(nn.Module):
             dtype=torch.bfloat16,
             low_cpu_mem_usage=True,
         )
-        self.visual = full.visual
+        # transformers 5.x moved the visual encoder to `.model.visual`; 4.x had `.visual`.
+        self.visual = full.model.visual if hasattr(full, "model") and hasattr(full.model, "visual") else full.visual
         del full
 
         if freeze:

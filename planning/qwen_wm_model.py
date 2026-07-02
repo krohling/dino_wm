@@ -87,7 +87,9 @@ class QwenWMModel:
             p.requires_grad = False
         self.processor = AutoProcessor.from_pretrained(model_id)
         self.tokenizer = self.processor.tokenizer
-        self.visual = self.full_model.visual
+        # transformers 5.x moved the visual encoder to `.model.visual`; 4.x had `.visual`.
+        _m = self.full_model
+        self.visual = _m.model.visual if hasattr(_m, "model") and hasattr(_m.model, "visual") else _m.visual
         # Discover the structural pieces we need to call directly:
         #   - vision blocks + patch_embed (run once on initial image)
         #   - merger (run on every rolled-out latent to lift 1152 -> 4096)
@@ -153,10 +155,23 @@ class QwenWMModel:
 
     # ------------------------------------------------------------------ image preprocessing
     def _pil_to_tensor(self, image: Image.Image) -> torch.Tensor:
-        """PIL RGB -> (3, image_size, image_size) float [0, 1]."""
+        """PIL RGB -> (3, image_size, image_size) float [0, 1].
+
+        Center-crops to a square first to match training preprocessing
+        (preprocessor did the same on 720x1280 / 768x768 source frames).
+        Without this, env frames at 320x180 get STRETCHED 1.78:1 -> 1:1 and
+        the encoder sees geometrically distorted input the predictor never
+        saw during training.
+        """
+        w, h = image.size
+        if w != h:
+            s = min(w, h)
+            left = (w - s) // 2
+            top = (h - s) // 2
+            image = image.crop((left, top, left + s, top + s))
         if image.size != (self.image_size, self.image_size):
             image = image.resize((self.image_size, self.image_size), Image.BILINEAR)
-        arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+        arr = np.asarray(image.convert("RGB"), dtype=np.uint8).copy()
         t = torch.from_numpy(arr).permute(2, 0, 1).float() / 255.0
         return t
 
