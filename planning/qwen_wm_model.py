@@ -590,8 +590,26 @@ class QwenWMModel:
             return rewards, weighted_rewards, rewards_with_grad_sum
         return rewards, weighted_rewards
 
-    # Compatibility no-op: SWM's interface also defines get_scores; we only need
-    # the rewards method for planning. Raise if anyone calls get_scores so it's
-    # obvious this path isn't supported by our adapter.
-    def get_scores(self, *args, **kwargs):
-        raise NotImplementedError("QwenWMModel only implements get_probabilistic_rewards_wm")
+    @torch.no_grad()
+    def get_scores(self, images, actions=None, questions=None):
+        """VQA on REAL frames (no prediction) -- used by SWM's OGB goal
+        generators for subgoal tracking (e.g., 'is the robot grasping X?'
+        decides when to switch from the grasp subgoal to the stack subgoal).
+
+        Matches SWMGradModel.get_scores contract: returns a tuple
+        (P(yes) tensor, P(no) tensor), one entry per image. `actions` is
+        ignored (the callers pass None).
+        """
+        if isinstance(questions, str):
+            questions = [questions] * len(images)
+        p_yes_parts = []
+        for img, q in zip(images, questions):
+            if not isinstance(img, Image.Image):
+                img = Image.fromarray(np.asarray(img, dtype=np.uint8))
+            z = self.encode_image(img)  # caches this frame's deepstack
+            emb = self._merge(z.unsqueeze(0))
+            prompt = self._build_prompt_info((str(q), "yes", 1.0))
+            p = self._llm_yes_no_probs(prompt, emb, gradient=False)
+            p_yes_parts.append(p)
+        p_yes = torch.cat(p_yes_parts, dim=0)
+        return (p_yes, 1.0 - p_yes)
