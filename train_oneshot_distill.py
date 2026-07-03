@@ -298,6 +298,14 @@ def main(cfg: DictConfig):
                               num_workers=cfg.training.num_workers, pin_memory=True,
                               drop_last=True, collate_fn=collate_keep_strings,
                               persistent_workers=cfg.training.num_workers > 0)
+    # Cap val (LLM forward per sample -- unbounded val would take hours on
+    # the expanded dataset's 5-horizon grid).
+    val_cap = int(cfg.training.get("val_max_samples", 3000))
+    if len(val_ds) > val_cap:
+        g = torch.Generator().manual_seed(cfg.seed)
+        idx = torch.randperm(len(val_ds), generator=g)[:val_cap].tolist()
+        val_ds = torch.utils.data.Subset(val_ds, idx)
+        log.info(f"val capped to {val_cap} samples")
     val_loader = DataLoader(val_ds, batch_size=cfg.training.val_batch_size, shuffle=False,
                             num_workers=cfg.training.num_workers, pin_memory=True,
                             collate_fn=collate_keep_strings,

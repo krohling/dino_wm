@@ -167,6 +167,14 @@ def main(cfg: DictConfig):
         drop_last=True,
         persistent_workers=cfg.training.num_workers > 0,
     )
+    # Large datasets explode the fixed-horizon val grid (5 horizons x every
+    # valid start); cap with a fixed random subset so val time stays bounded.
+    val_cap = int(cfg.training.get("val_max_samples", 5000))
+    if len(val_ds) > val_cap:
+        g = torch.Generator().manual_seed(cfg.seed)
+        idx = torch.randperm(len(val_ds), generator=g)[:val_cap].tolist()
+        val_ds = torch.utils.data.Subset(val_ds, idx)
+        log.info(f"val capped to {val_cap} samples")
     val_loader = DataLoader(
         val_ds,
         batch_size=cfg.training.val_batch_size,
