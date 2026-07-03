@@ -70,7 +70,13 @@ class QwenWMModel:
         obs_horizon: int = 2,
         max_action_horizon: int = 16,
         chat_template_question_format: str = "{question}",
+        use_deepstack_for_predictions: bool = True,
     ):
+        # use_deepstack_for_predictions: when scoring PREDICTED latents, pass
+        # the current frame's deepstack (True; approximation used by the cosine
+        # model) or none (False; matches how the distill student was trained --
+        # its readout never saw deepstack on predicted latents).
+        self.use_deepstack_for_predictions = use_deepstack_for_predictions
         self.device = device
         self.precision = precision
         self.image_size = image_size
@@ -569,7 +575,14 @@ class QwenWMModel:
             for q_idx, prompt in enumerate(prompt_infos):
                 for s in range(0, M, batch_size):
                     e = min(s + batch_size, M)
-                    p_yes = self._llm_yes_no_probs(prompt, img_embeds[s:e], gradient)
+                    if self.use_deepstack_for_predictions:
+                        p_yes = self._llm_yes_no_probs(prompt, img_embeds[s:e], gradient)
+                    else:
+                        # Distill-trained student: score predicted latents
+                        # exactly as during training (no deepstack).
+                        p_yes = self._llm_yes_no_probs(
+                            prompt, img_embeds[s:e], gradient, deepstack_override=[],
+                        )
                     # Distribute to (q_idx, a_idx, h_step-action_skip:h_step)
                     for k, (a_idx, h_step) in enumerate(big_meta[s:e]):
                         # Fill the band ending at h_step

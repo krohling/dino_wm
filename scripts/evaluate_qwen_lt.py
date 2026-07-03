@@ -99,6 +99,7 @@ def run(cfg: DictConfig):
         image_size=cfg.image_size,
         obs_horizon=cfg.obs_horizon,
         max_action_horizon=cfg.max_action_horizon,
+        use_deepstack_for_predictions=cfg.get("use_deepstack_for_predictions", True),
     )
 
     overall_success = 0
