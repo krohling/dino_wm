@@ -375,13 +375,23 @@ def main(cfg: DictConfig):
                 for i, q in enumerate(questions):
                     if has_t[i]:
                         idx_by_q[q].append(i)
+                # Class-weighted BCE: the expanded (play/noisy-heavy) dataset has
+                # sparse teacher-yes questions -- per-frame balanced sampling
+                # alone still yields ~25% yes and the student collapses to
+                # constant-no. Weight yes-target samples up.
+                yes_w = float(cfg.distill.get("yes_weight", 3.0))
                 bce_terms = []
+                w_total = 0.0
                 for q, idxs in idx_by_q.items():
                     pi = head._prompt(q)
                     p_yes = head.p_yes(pi, img_embeds[idxs])
                     t_p = teacher_p[idxs]
-                    bce_terms.append(F.binary_cross_entropy(p_yes.clamp(1e-6, 1 - 1e-6), t_p, reduction="sum"))
-                bce_loss = torch.stack(bce_terms).sum() / max(1, int(has_t.sum()))
+                    w = torch.where(t_p >= 0.5, torch.full_like(t_p, yes_w), torch.ones_like(t_p))
+                    bce_terms.append(
+                        F.binary_cross_entropy(p_yes.clamp(1e-6, 1 - 1e-6), t_p, weight=w, reduction="sum")
+                    )
+                    w_total += float(w.sum())
+                bce_loss = torch.stack(bce_terms).sum() / max(1.0, w_total)
 
             loss = cos_w * cos_loss + kl_w * bce_loss
             optimizer.zero_grad(set_to_none=True)
