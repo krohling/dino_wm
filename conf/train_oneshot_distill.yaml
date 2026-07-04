@@ -19,6 +19,8 @@ init_from: null
 distill:
   cos_weight: 1.0
   kl_weight: 1.0
+  yes_weight: 3.0
+  label_source: teacher   # teacher | oracle
 
 training:
   epochs: 20

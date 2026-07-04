@@ -78,12 +78,29 @@ class TeacherStore:
 
 
 class DistillDataset(SWMOneShotDataset):
-    """SWMOneShotDataset + a randomly-drawn teacher question for the target frame."""
+    """SWMOneShotDataset + a randomly-drawn question for the target frame.
 
-    def __init__(self, *args, teacher_store: TeacherStore = None, **kwargs):
+    label_source:
+      "teacher" -- soft target = frozen VLM's P(yes) on the real future frame
+                   (student learns to be VQA-equivalent to the truth as READ
+                   by the judge)
+      "oracle"  -- hard target = simulator ground truth (SWM's actual label
+                   source; student learns to make the judge emit TRUE answers
+                   on predicted latents, even where the judge misreads reality)
+    """
+
+    def __init__(self, *args, teacher_store: TeacherStore = None,
+                 label_source: str = "teacher", **kwargs):
         super().__init__(*args, **kwargs)
+        assert label_source in ("teacher", "oracle"), label_source
         self.teacher = teacher_store
+        self.label_source = label_source
         self._rng = np.random.default_rng(kwargs.get("seed", 0) + 7)
+
+    def _target_of(self, e) -> float:
+        if self.label_source == "teacher":
+            return float(e["p_yes"])
+        return 1.0 if e.get("oracle") else 0.0
 
     def __getitem__(self, idx):
         item = super().__getitem__(idx)
@@ -96,19 +113,21 @@ class DistillDataset(SWMOneShotDataset):
         ep_id = self.episodes[ep_idx]["id"]
         target_frame = t_start + H
         entries = self.teacher.entries(ep_id, target_frame) if self.teacher else []
+        if self.label_source == "oracle":
+            entries = [e for e in entries if e.get("oracle") is not None]
         if entries:
-            # Teacher answers are ~77% "no"; unbalanced sampling collapses the
-            # student to constant-no (observed: yes-recall 0.05 by epoch 2).
-            # Draw from the teacher-yes pool half the time when possible.
-            yes_pool = [e for e in entries if e["p_yes"] >= 0.5]
-            no_pool = [e for e in entries if e["p_yes"] < 0.5]
+            # Labels are ~77% "no"; unbalanced sampling collapses the student
+            # to constant-no. Draw from the yes pool (per the active label
+            # source) half the time when possible.
+            yes_pool = [e for e in entries if self._target_of(e) >= 0.5]
+            no_pool = [e for e in entries if self._target_of(e) < 0.5]
             if yes_pool and (not no_pool or self._rng.random() < 0.5):
                 pool = yes_pool
             else:
                 pool = no_pool or yes_pool
             e = pool[self._rng.integers(len(pool))]
             item["question"] = e["q"]
-            item["teacher_p_yes"] = torch.tensor(float(e["p_yes"]), dtype=torch.float32)
+            item["teacher_p_yes"] = torch.tensor(self._target_of(e), dtype=torch.float32)
             item["has_teacher"] = torch.tensor(True)
         else:
             item["question"] = ""
@@ -279,11 +298,12 @@ def main(cfg: DictConfig):
     train_ids = [eps[i]["id"] for i in perm[:n_train]]
     val_ids = [eps[i]["id"] for i in perm[n_train:]] or [eps[perm[-1]]["id"]]
 
+    label_source = str(cfg.distill.get("label_source", "teacher"))
     train_ds = DistillDataset(
         data_path=cfg.data_path, max_action_horizon=cfg.max_action_horizon,
         obs_horizon=cfg.obs_horizon, eval_horizons=None,
         normalize_action=cfg.normalize_action, episode_ids=train_ids,
-        seed=cfg.seed, teacher_store=teacher,
+        seed=cfg.seed, teacher_store=teacher, label_source=label_source,
     )
     val_ds = DistillDataset(
         data_path=cfg.data_path, max_action_horizon=cfg.max_action_horizon,
@@ -291,6 +311,7 @@ def main(cfg: DictConfig):
         normalize_action=cfg.normalize_action,
         action_mean=train_ds.action_mean, action_std=train_ds.action_std,
         episode_ids=val_ids, seed=cfg.seed + 1, teacher_store=teacher,
+        label_source=label_source,
     )
     log.info(f"train samples: {len(train_ds)}  val samples: {len(val_ds)}  action_dim: {train_ds.action_dim}")
 
