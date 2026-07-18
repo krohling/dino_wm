@@ -337,11 +337,22 @@ def main(cfg: DictConfig):
     head = StudentVQAHead(cfg.encoder.model_id, device=device, image_size=cfg.img_size)
 
     log.info("building encoder wrapper (shares weights conceptually but separate load)")
-    encoder = Qwen3VLViTEncoder(model_id=cfg.encoder.model_id, image_size=cfg.img_size, freeze=True).to(device)
+    output_stage = str(cfg.encoder.get("output_stage", "pre_merger"))
+    encoder = Qwen3VLViTEncoder(model_id=cfg.encoder.model_id, image_size=cfg.img_size,
+                                freeze=True, output_stage=output_stage).to(device)
+    log.info(f"encoder output_stage={output_stage}  emb_dim={encoder.emb_dim}  num_patches={encoder.num_patches}")
     # NOTE: this loads the ViT a second time (~1.2 GB bf16) -- acceptable.
 
+    # In post-merger space the latent dim (LLM input width) is too wide to use
+    # as the transformer width; run internally at predictor.internal_dim with
+    # linear io projections.
+    if output_stage == "post_merger":
+        internal = int(cfg.predictor.get("internal_dim", 1152))
+        pred_emb, pred_io = internal, encoder.emb_dim
+    else:
+        pred_emb, pred_io = encoder.emb_dim, None
     predictor = OneShotPredictor(
-        emb_dim=encoder.emb_dim, action_dim=train_ds.action_dim,
+        emb_dim=pred_emb, io_dim=pred_io, action_dim=train_ds.action_dim,
         num_patches=encoder.num_patches, obs_horizon=cfg.obs_horizon,
         max_action_horizon=cfg.max_action_horizon,
         depth=cfg.predictor.depth, heads=cfg.predictor.heads,
@@ -391,7 +402,8 @@ def main(cfg: DictConfig):
             if has_t.any() and kl_w > 0:
                 # group by question so each LLM batch shares a prompt
                 z_pred = out["z_pred"]  # (B, P, D) fp32, grads intact
-                img_embeds = head.merge(z_pred)
+                # post-merger predictions are already in the LLM input space
+                img_embeds = z_pred.to(head.precision) if output_stage == "post_merger" else head.merge(z_pred)
                 idx_by_q = defaultdict(list)
                 for i, q in enumerate(questions):
                     if has_t[i]:
@@ -446,7 +458,8 @@ def main(cfg: DictConfig):
                 out = model(history, actions, action_mask, target)
                 v_cos += float(out["cos_sim"]) * history.shape[0]; v_n += history.shape[0]
                 if has_t.any():
-                    img_embeds = head.merge(out["z_pred"])
+                    img_embeds = (out["z_pred"].to(head.precision) if output_stage == "post_merger"
+                                  else head.merge(out["z_pred"]))
                     idx_by_q = defaultdict(list)
                     for i, q in enumerate(questions):
                         if has_t[i]:

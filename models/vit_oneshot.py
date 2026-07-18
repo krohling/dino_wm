@@ -36,14 +36,28 @@ class OneShotPredictor(nn.Module):
         heads: int = 16,
         mlp_dim: int = 2048,
         dropout: float = 0.1,
+        io_dim: int | None = None,
     ):
+        """io_dim: when the latent space (e.g. post-merger LLM embeddings,
+        ~2048-4096 dim) is wider than the transformer we can afford, set
+        io_dim to the latent dim and emb_dim to the internal width; linear
+        in/out projections bridge the two. io_dim=None means io == emb_dim
+        (the original behavior)."""
         super().__init__()
         assert emb_dim % heads == 0, f"emb_dim {emb_dim} not divisible by heads {heads}"
         self.emb_dim = emb_dim
+        self.io_dim = io_dim if io_dim is not None else emb_dim
         self.action_dim = action_dim
         self.num_patches = num_patches
         self.obs_horizon = obs_horizon
         self.max_action_horizon = max_action_horizon
+
+        if self.io_dim != emb_dim:
+            self.in_proj = nn.Linear(self.io_dim, emb_dim)
+            self.out_proj = nn.Linear(emb_dim, self.io_dim)
+        else:
+            self.in_proj = nn.Identity()
+            self.out_proj = nn.Identity()
 
         # Action -> emb_dim (LayerNorm to stabilize across tasks with different action scales)
         self.action_proj = nn.Sequential(
@@ -97,11 +111,12 @@ class OneShotPredictor(nn.Module):
         B = z_obs.shape[0]
         assert z_obs.shape[1] == self.obs_horizon, (z_obs.shape, self.obs_horizon)
         assert z_obs.shape[2] == self.num_patches
-        assert z_obs.shape[3] == self.emb_dim
+        assert z_obs.shape[3] == self.io_dim, (z_obs.shape, self.io_dim)
         assert actions.shape == (B, self.max_action_horizon, self.action_dim), (
             actions.shape, (B, self.max_action_horizon, self.action_dim)
         )
 
+        z_obs = self.in_proj(z_obs)
         vis = z_obs.reshape(B, self.n_visual_tokens, self.emb_dim) + self.visual_pos
         act = self.action_proj(actions) + self.action_pos
         qry = self.query_tokens.expand(B, -1, -1) + self.query_pos
@@ -118,4 +133,4 @@ class OneShotPredictor(nn.Module):
 
         out = self.transformer(seq, src_key_padding_mask=pad)
         out = self.final_norm(out)
-        return out[:, -self.num_patches :, :]  # query positions
+        return self.out_proj(out[:, -self.num_patches :, :])  # query positions

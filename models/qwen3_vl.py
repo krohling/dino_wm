@@ -28,11 +28,14 @@ class Qwen3VLViTEncoder(nn.Module):
         model_id: str = "Qwen/Qwen3-VL-8B-Instruct",
         image_size: int = 448,
         freeze: bool = True,
+        output_stage: str = "pre_merger",
     ):
         super().__init__()
         # DO NOT put "dino" in the name -- it triggers a Resize in VWorldModel.
         self.name = "qwen3_vl"
         self.image_size = image_size
+        assert output_stage in ("pre_merger", "post_merger"), output_stage
+        self.output_stage = output_stage
 
         from transformers import Qwen3VLForConditionalGeneration, AutoConfig
 
@@ -41,15 +44,22 @@ class Qwen3VLViTEncoder(nn.Module):
         self.patch_size = int(vc.patch_size)
         self.temporal_patch_size = int(getattr(vc, "temporal_patch_size", 2))
         self.merge_size = int(getattr(vc, "spatial_merge_size", 2))
-        # Pre-merger hidden size (1152 for Qwen3-VL-8B).
-        self.emb_dim = int(vc.hidden_size)
 
         assert image_size % self.patch_size == 0, (
             f"image_size {image_size} must be divisible by patch_size {self.patch_size}"
         )
         self.grid_h = image_size // self.patch_size
         self.grid_w = image_size // self.patch_size
-        self.num_patches = self.grid_h * self.grid_w  # 784 at 448x448 patch=16
+
+        if output_stage == "pre_merger":
+            # Pre-merger: 784 tokens at vision hidden size (1152).
+            self.emb_dim = int(vc.hidden_size)
+            self.num_patches = self.grid_h * self.grid_w
+        else:
+            # Post-merger: merged tokens in the LLM input embedding space.
+            # These are exactly what masked_scatter injects into the LLM.
+            self.emb_dim = int(vc.out_hidden_size)
+            self.num_patches = (self.grid_h // self.merge_size) * (self.grid_w // self.merge_size)
 
         # latent_ndim = 2 means VWorldModel treats output as (B, P, D).
         self.latent_ndim = 2
@@ -122,6 +132,21 @@ class Qwen3VLViTEncoder(nn.Module):
         ).repeat(B, 1)
         return x, thw
 
+    @staticmethod
+    def _post_merger_from_visual_output(out) -> torch.Tensor:
+        """Extract merged image embeddings from visual() across transformers
+        4.x (tuple) and 5.x (BaseModelOutputWithDeepstackFeatures)."""
+        if isinstance(out, tuple):
+            post = out[0]
+        else:
+            post = getattr(out, "pooler_output", None)
+            if post is None:
+                post = out.last_hidden_state
+        # 5.x pooler_output may be a tuple of per-image tensors.
+        if isinstance(post, (tuple, list)):
+            post = torch.cat(list(post), dim=0)
+        return post
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (B, 3, H, W) in [0, 1] -> (B, num_patches, emb_dim)."""
         B = x.shape[0]
@@ -131,9 +156,14 @@ class Qwen3VLViTEncoder(nn.Module):
         # tensor so DataParallel/AMP wrappers behave.
         if not any(p.requires_grad for p in self.visual.parameters()):
             with torch.no_grad():
-                _ = self.visual(pv, grid_thw=thw)
+                out = self.visual(pv, grid_thw=thw)
         else:
-            _ = self.visual(pv, grid_thw=thw)
+            out = self.visual(pv, grid_thw=thw)
+        if self.output_stage == "post_merger":
+            post = self._post_merger_from_visual_output(out)
+            self._captured = None
+            post = rearrange(post, "(b p) d -> b p d", b=B)
+            return post.float()
         pre = self._captured
         self._captured = None
         assert pre is not None, "merger pre-hook did not fire"
