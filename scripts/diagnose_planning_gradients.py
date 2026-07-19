@@ -158,7 +158,7 @@ def main():
             model.reset_episode()
         success, time_taken = swm_eval(
             seed=seed, reward_type="stack_blocks", env_type="ogbench",
-            device=device, output_dir=str(out.parent / f"ep_{seed}"),
+            device=device, output_dir=str(out.parent / out.stem / f"ep_{seed}"),
             ckpt_path=ckpt_path, processor_path=processor_path, model=model,
             diffusion_path=diffusion_path,
             diffusion=True, mppi=False, gradient=True, expert_diffusion=False,
