@@ -125,6 +125,9 @@ def main():
     ap.add_argument("--seed-start", type=int, default=6000)
     ap.add_argument("--num-seeds", type=int, default=5)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--planner", choices=("gradient", "mppi"), default="gradient",
+                    help="mppi: 16-sample derivative-free planning; also stubs the "
+                         "heat-map viz (SWM's viz code crashes on MPPI action format)")
     args = ap.parse_args()
 
     device = "cuda"
@@ -156,16 +159,21 @@ def main():
         RECORDS.clear()
         if model is not None and hasattr(model, "reset_episode"):
             model.reset_episode()
+        use_mppi = args.planner == "mppi"
+        if use_mppi:
+            # SWM's get_heat_map crashes on MPPI's action format; stub it.
+            PA.get_heat_map = lambda env, obs, actions, rewards, *a, **k: obs
         success, time_taken = swm_eval(
             seed=seed, reward_type="stack_blocks", env_type="ogbench",
             device=device, output_dir=str(out.parent / out.stem / f"ep_{seed}"),
             ckpt_path=ckpt_path, processor_path=processor_path, model=model,
             diffusion_path=diffusion_path,
-            diffusion=True, mppi=False, gradient=True, expert_diffusion=False,
+            diffusion=True, mppi=use_mppi, gradient=not use_mppi, expert_diffusion=False,
             precision=torch.bfloat16, action_skip=8, model_batch_size=16,
             reward_kwargs={"block_combo": block_combo, "ood": False},
             action_dim=5, num_steps=50, num_actions_executed=4,
-            pred_horizon=16, num_samples=1, num_planning_iters=20,
+            pred_horizon=16, num_samples=(16 if use_mppi else 1),
+            num_planning_iters=(10 if use_mppi else 20),
             gradient_lr=0.2, gradient_clipping_value=10.0,
             mppi_temperature=1.0, intermediate_hm=False,
         )
