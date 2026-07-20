@@ -114,11 +114,29 @@ class QwenWMModel:
         ckpt = torch.load(predictor_ckpt_path, map_location="cpu", weights_only=False)
         from models.vit_oneshot import OneShotPredictor
         cfg = ckpt["cfg"]
-        encoder_emb_dim = int(self.full_model.config.vision_config.hidden_size)
         action_dim = int(ckpt["action_mean"].shape[0])
-        num_patches = (image_size // int(self.full_model.config.vision_config.patch_size)) ** 2
+        vc = self.full_model.config.vision_config
+        grid = image_size // int(vc.patch_size)
+        merge = int(getattr(vc, "spatial_merge_size", 2))
+        # Infer the prediction space from the checkpoint weights themselves:
+        #   query_tokens: (1, num_patches, internal_dim); in_proj present => io projections.
+        sd = ckpt["predictor"]
+        ck_patches = int(sd["query_tokens"].shape[1])
+        ck_internal = int(sd["query_tokens"].shape[2])
+        ck_io = int(sd["in_proj.weight"].shape[1]) if "in_proj.weight" in sd else None
+        if ck_patches == (grid // merge) ** 2:
+            self.predict_space = "post_merger"
+            encoder_emb_dim = int(vc.out_hidden_size)   # latent dim the adapter moves around
+            num_patches = ck_patches
+        else:
+            self.predict_space = "pre_merger"
+            encoder_emb_dim = int(vc.hidden_size)
+            num_patches = grid ** 2
+        log.info(f"  predict_space={self.predict_space}  latent=({num_patches}x{encoder_emb_dim})  "
+                 f"predictor internal={ck_internal} io={ck_io}")
         self.predictor = OneShotPredictor(
-            emb_dim=encoder_emb_dim,
+            emb_dim=ck_internal,
+            io_dim=ck_io,
             action_dim=action_dim,
             num_patches=num_patches,
             obs_horizon=obs_horizon,
@@ -225,10 +243,18 @@ class QwenWMModel:
             deepstack = out.deepstack_features
         else:
             deepstack = None
+        self._last_deepstack = deepstack
+        if self.predict_space == "post_merger":
+            post = out[0] if isinstance(out, tuple) else getattr(out, "pooler_output", None)
+            if post is None:
+                post = out.last_hidden_state
+            if isinstance(post, (tuple, list)):
+                post = torch.cat(list(post), dim=0)
+            self._pre_merger = None
+            return post.view((gh // m) * (gw // m), -1)  # (196, 4096)
         pre = self._pre_merger
         self._pre_merger = None
         assert pre is not None
-        self._last_deepstack = deepstack
         return pre.view(gh * gw, -1)  # (num_patches, 1152)
 
     # ------------------------------------------------------------------ predictor rollout
@@ -569,7 +595,10 @@ class QwenWMModel:
                 z_preds_all.append(z_pred)
             z_preds = torch.cat(z_preds_all, dim=0)  # (M, P, D_in) fp32
             # --- 4. Project to post-merger image embeddings (merger is bf16) ---
-            img_embeds = self._merge(z_preds.to(self.precision))  # (M, P_out, D_out)
+            if self.predict_space == "post_merger":
+                img_embeds = z_preds.to(self.precision)  # already in LLM space
+            else:
+                img_embeds = self._merge(z_preds.to(self.precision))  # (M, P_out, D_out)
 
             # --- 5. Score each prompt for each (a_idx, h_step) ---
             for q_idx, prompt in enumerate(prompt_infos):
@@ -620,7 +649,10 @@ class QwenWMModel:
             if not isinstance(img, Image.Image):
                 img = Image.fromarray(np.asarray(img, dtype=np.uint8))
             z = self.encode_image(img)  # caches this frame's deepstack
-            emb = self._merge(z.unsqueeze(0))
+            if self.predict_space == "post_merger":
+                emb = z.unsqueeze(0).to(self.precision)
+            else:
+                emb = self._merge(z.unsqueeze(0))
             prompt = self._build_prompt_info((str(q), "yes", 1.0))
             p = self._llm_yes_no_probs(prompt, emb, gradient=False)
             p_yes_parts.append(p)
