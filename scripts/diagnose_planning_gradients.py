@@ -161,8 +161,16 @@ def main():
             model.reset_episode()
         use_mppi = args.planner == "mppi"
         if use_mppi:
-            # SWM's get_heat_map crashes on MPPI's action format; stub it.
-            PA.get_heat_map = lambda env, obs, actions, rewards, *a, **k: obs
+            # SWM's get_heat_map crashes on MPPI's action format; stub it with
+            # a single blank PIL image (eval calls hm[j].save(...)).
+            from PIL import Image as _Img
+            import numpy as _np
+            def _hm_stub(env, obs, actions, rewards, *a, **k):
+                arr = _np.asarray(obs, dtype=_np.uint8)
+                if arr.ndim != 3:
+                    arr = _np.zeros((64, 64, 3), dtype=_np.uint8)
+                return [_Img.fromarray(arr)]
+            PA.get_heat_map = _hm_stub
         success, time_taken = swm_eval(
             seed=seed, reward_type="stack_blocks", env_type="ogbench",
             device=device, output_dir=str(out.parent / out.stem / f"ep_{seed}"),
